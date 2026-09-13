@@ -1,5 +1,6 @@
 import base64
 import os
+import re
 import subprocess
 import tempfile
 
@@ -10,13 +11,21 @@ def _write_cookie_secret(workdir):
     if not encoded:
         return None
 
+    # Base64 copied from some command-line tools may contain line wrapping.
+    # Ignore whitespace so both wrapped and single-line secrets work.
+    encoded = re.sub(r"\s+", "", encoded)
     try:
         cookie_bytes = base64.b64decode(encoded, validate=True)
     except Exception as exc:
         raise RuntimeError("YOUTUBE_COOKIES_B64 is not valid base64") from exc
 
+    # Some editors/exporters add a UTF-8 BOM before the Netscape header.
+    cookie_bytes = cookie_bytes.lstrip(b"\xef\xbb\xbf")
     if not cookie_bytes.startswith((b"# HTTP Cookie File", b"# Netscape HTTP Cookie File")):
-        raise RuntimeError("YOUTUBE_COOKIES_B64 does not contain a Netscape/Mozilla cookie file")
+        raise RuntimeError(
+            "YOUTUBE_COOKIES_B64 does not contain a Netscape/Mozilla cookie file. "
+            "Export the cookies as a Netscape/Mozilla cookies.txt file and base64-encode that file."
+        )
 
     fd, path = tempfile.mkstemp(prefix="youtube-cookies-", suffix=".txt", dir=workdir)
     try:
