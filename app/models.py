@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field
 from typing import Optional
 
+
 class AIClipRequest(BaseModel):
     source: str = "youtube"
     url: str
@@ -10,6 +11,7 @@ class AIClipRequest(BaseModel):
     min_duration: int = Field(default=20, ge=5, le=180)
     max_duration: int = Field(default=60, ge=10, le=300)
     language: Optional[str] = None
+
 
 class ClipCandidate(BaseModel):
     start: float
@@ -21,10 +23,11 @@ class ClipCandidate(BaseModel):
     transcript: str
     file: Optional[str] = None
 
+
 class AIJob(BaseModel):
     id: str
     status: str
     progress: int = 0
     stage: str = "queued"
     error: Optional[str] = None
-    clips: list[ClipCandidate] = []
+    clips: list[ClipCandidate] = Field(default_factory=list)
