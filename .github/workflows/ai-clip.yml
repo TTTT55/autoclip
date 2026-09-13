@@ -1,0 +1,111 @@
+name: AutoClip AI
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Video URL (YouTube or any yt-dlp supported URL)"
+        required: true
+        type: string
+      chat_id:
+        description: "Telegram chat ID to receive the clips"
+        required: true
+        type: string
+      max_clips:
+        description: "Number of clips"
+        required: false
+        default: "5"
+        type: string
+      job_id:
+        description: "AutoClip job ID"
+        required: false
+        default: "manual"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  clip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OLLAMA_MODEL: qwen3:1.7b
+      OLLAMA_TIMEOUT: 900
+      WHISPER_MODEL: base
+      WHISPER_DEVICE: cpu
+      WHISPER_COMPUTE_TYPE: int8
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ inputs.chat_id }}
+      AUTOCLIP_JOB_ID: ${{ inputs.job_id }}
+
+    steps:
+      - name: Check out AutoClip
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Restore AI model caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.ollama/models
+            ~/.cache/huggingface
+          key: autoclip-ai-models-v1-${{ runner.os }}-qwen3-1.7b-whisper-base
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: Install and start Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          nohup ollama serve > /tmp/ollama.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:11434/api/tags >/dev/null
+          ollama pull "$OLLAMA_MODEL"
+
+      - name: Run AI clipping pipeline
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        run: |
+          python scripts/run_telegram_job.py "$VIDEO_URL" "${{ inputs.max_clips }}"
+
+      - name: Upload generated clips as fallback artifacts
+        if: ${{ always() && hashFiles('temp/**/*.mp4') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: autoclip-${{ inputs.job_id }}
+          path: temp/**/*.mp4
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Notify Telegram about failure
+        if: ${{ failure() }}
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+          token = os.environ["TELEGRAM_BOT_TOKEN"]
+          chat_id = os.environ["TELEGRAM_CHAT_ID"]
+          job_id = os.environ["AUTOCLIP_JOB_ID"]
+          requests.post(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              data={"chat_id": chat_id, "text": f"❌ AutoClip job {job_id} failed. Check the GitHub Actions run logs for details."},
+              timeout=30,
+          ).raise_for_status()
+          PY
