@@ -50,6 +50,11 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
 
+      - name: Set up Deno for yt-dlp YouTube extraction
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: lts
+
       - name: Install FFmpeg
         run: |
           sudo apt-get update
