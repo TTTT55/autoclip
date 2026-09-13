@@ -4,6 +4,14 @@ import sys
 import time
 from pathlib import Path
 
+# When this file is executed as `python scripts/run_telegram_job.py`, Python
+# puts `scripts/` on sys.path rather than the repository root. Add the root so
+# the application packages can be imported reliably in GitHub Actions and
+# local CLI usage.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import requests
 
 from app.models import AIClipRequest
