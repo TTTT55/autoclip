@@ -38,6 +38,9 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ inputs.chat_id }}
       AUTOCLIP_JOB_ID: ${{ inputs.job_id }}
+      # Optional base64-encoded Netscape YouTube cookie file.
+      # Leave unset for videos that can be downloaded without cookies.
+      YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
 
     steps:
       - name: Check out AutoClip
