@@ -26,8 +26,11 @@ def render_clip(video, start, end, words, aspect_ratio="9:16", caption_style="wo
     subprocess.run(
         [
             "ffmpeg", "-y", "-ss", str(start), "-to", str(end), "-i", video,
-            "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-c:a", "aac", "-movflags", "+faststart", output,
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+            "-maxrate", os.getenv("VIDEO_MAXRATE", "4.5M"),
+            "-bufsize", os.getenv("VIDEO_BUFSIZE", "9M"),
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", output,
         ],
         check=True,
     )
