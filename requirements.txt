@@ -3,3 +3,7 @@ uvicorn
 yt-dlp
 gdown
 python-multipart
+faster-whisper
+requests
+python-dotenv
+pydantic-settings
