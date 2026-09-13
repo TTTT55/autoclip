@@ -4,11 +4,11 @@ AutoClip can be driven from a Telegram bot while the video-processing job runs o
 
 ## Architecture
 
-Telegram -> Heroku webhook -> GitHub Actions -> Ollama + faster-whisper + FFmpeg -> Telegram
+Telegram -> Azure Functions webhook -> GitHub Actions -> Ollama + faster-whisper + FFmpeg -> Telegram
 
-The Telegram gateway is in `telegram_bot/`. It is intentionally lightweight so the Heroku app does not need the AI dependencies.
+The Azure gateway is in `azure_function/`. It is intentionally lightweight: Azure only receives Telegram webhooks and dispatches GitHub Actions. The AI/video processing stays on GitHub Actions.
 
-## 1. GitHub repository secrets
+## 1. GitHub repository secret
 
 Add this Actions secret to the AutoClip repository:
 
@@ -16,39 +16,36 @@ Add this Actions secret to the AutoClip repository:
 
 The workflow reads the Telegram chat ID from the workflow input and sends finished MP4s directly to that chat.
 
-## 2. Heroku config vars
+## 2. Azure Function App configuration
 
-Deploy the contents of `telegram_bot/` as the root of a small Heroku app. The app needs:
+Create a Python Azure Function App and deploy the contents of `azure_function/`. Add these Application Settings:
 
 - `TELEGRAM_BOT_TOKEN`: same BotFather token.
 - `TELEGRAM_WEBHOOK_SECRET`: a long random secret used to authenticate Telegram webhook calls.
-- `GITHUB_ACTIONS_TOKEN`: a fine-grained GitHub token with **Actions: Read and write** permission on `TTTT55/autoclip`.
+- `GITHUB_ACTIONS_TOKEN`: the fine-grained GitHub token with **Actions: Read and write** permission on `TTTT55/autoclip`.
 - `GITHUB_REPO`: `TTTT55/autoclip`.
 - `GITHUB_REF`: `main` after the feature branch is merged.
-- `ALLOWED_CHAT_IDS`: your Telegram numeric chat ID. This keeps strangers from using your bot.
+- `ALLOWED_CHAT_IDS`: `394533027` (your Telegram numeric chat ID).
 - `MAX_CLIPS`: optional default, normally `5`.
 
-The Heroku process is defined by `telegram_bot/Procfile`.
+The function exposes:
 
-### Deploying the subdirectory with Heroku CLI
+- `GET /api/health`
+- `POST /api/telegram/webhook`
 
-From a clone of this repository:
-
-```bash
-git subtree push --prefix telegram_bot heroku main
-```
-
-The subtree becomes the root of the Heroku app, so Heroku sees its `requirements.txt` and `Procfile` directly.
+Azure Functions normally includes the `/api/` prefix in these URLs.
 
 ## 3. Set the Telegram webhook
 
-After Heroku gives you an HTTPS app URL, call Telegram's `setWebhook` method with the same secret configured in Heroku:
+After Azure gives you the Function App HTTPS hostname, configure Telegram using the same secret stored in Azure:
 
 ```bash
 curl -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
-  -d "url=https://YOUR-HEROKU-APP.herokuapp.com/telegram/webhook" \
+  -d "url=https://YOUR-FUNCTION-APP.azurewebsites.net/api/telegram/webhook" \
   -d "secret_token=$TELEGRAM_WEBHOOK_SECRET"
 ```
+
+Then verify the webhook with Telegram's `getWebhookInfo` method.
 
 ## 4. Use the bot
 
@@ -73,6 +70,8 @@ The workflow is `.github/workflows/ai-clip.yml`. It supports `workflow_dispatch`
 The cloud runner uses `qwen3:1.7b` and Whisper `base` to keep CPU processing practical. Local development can use larger models by changing `OLLAMA_MODEL` and `WHISPER_MODEL` in `.env`.
 
 The workflow caches the Ollama and Whisper model files between runs and uploads generated MP4s as a short-lived artifact as a fallback.
+
+**Important:** merge the `feat/ai-clipping` PR into `main` before using the Telegram gateway. The workflow must exist on the default branch for reliable `workflow_dispatch` use.
 
 ## 6. Local AI
 
