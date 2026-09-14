@@ -7,3 +7,4 @@ faster-whisper
 requests
 python-dotenv
 pydantic-settings
+opencv-contrib-python-headless>=4.10,<5
