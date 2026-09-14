@@ -1,12 +1,15 @@
 """AI clip selection using a local Ollama model.
 
-The selector intentionally sends a small set of candidate windows to Ollama
-instead of the entire word-level transcript. This keeps CPU inference practical
-on GitHub-hosted runners while still letting the model choose the best moment.
+The selector builds sentence-aligned candidate windows across the whole video,
+then asks Ollama to rank those candidates. This avoids position bias toward the
+opening and prevents clips from ending in the middle of a spoken sentence.
 """
 
+import hashlib
 import json
 import os
+import random
+import re
 from typing import Any
 
 import requests
@@ -35,7 +38,7 @@ def _chat(prompt: str) -> dict[str, Any]:
             "options": {
                 "temperature": 0.1,
                 "num_ctx": 4096,
-                "num_predict": 256,
+                "num_predict": 512,
             },
         },
         timeout=OLLAMA_TIMEOUT,
@@ -51,104 +54,110 @@ def _chat(prompt: str) -> dict[str, Any]:
         raise RuntimeError(f"Ollama returned invalid JSON: {content[:500]}") from exc
 
 
-def _fallback_clip(words, min_duration, max_duration):
-    """Return a deterministic clip when the local model cannot select one."""
-    if not words:
-        return None
-
-    total_duration = float(words[-1]["end"]) - float(words[0]["start"])
-    if total_duration < min_duration:
-        return None
-
-    target = min(45.0, float(max_duration))
-    target = max(float(min_duration), target)
-
-    # Start around the middle, but clamp so the complete window fits.
-    start_time = max(float(words[0]["start"]),
-                     min((float(words[-1]["end"]) - target),
-                         (float(words[0]["start"]) + float(words[-1]["end"]) - target) / 2))
-    start_pos = min(range(len(words)), key=lambda i: abs(float(words[i]["start"]) - start_time))
-    end_time = float(words[start_pos]["start"]) + target
-    end_pos = min(range(start_pos, len(words)), key=lambda i: abs(float(words[i]["end"]) - end_time))
-
-    start = float(words[start_pos]["start"])
-    end = float(words[end_pos]["end"])
-    if end - start < min_duration:
-        for i in range(end_pos + 1, len(words)):
-            if float(words[i]["end"]) - start >= min_duration:
-                end_pos = i
-                end = float(words[i]["end"])
-                break
-
-    duration = end - start
-    if duration < min_duration or duration > max_duration:
-        return None
-
-    return {
-        "start": start,
-        "end": end,
-        "score": 50,
-        "title": "Highlight",
-        "hook": "A highlight selected from the video's transcript.",
-        "reason": "Fallback used because the local AI selector was unavailable or timed out.",
-        "transcript": " ".join(w["text"] for w in words[start_pos : end_pos + 1]),
-    }
+def _sentence_ranges(words):
+    """Group Whisper words into sentence-like ranges using punctuation and pauses."""
+    ranges = []
+    start = 0
+    for i, word in enumerate(words):
+        text = str(word.get("text", ""))
+        next_start = float(words[i + 1]["start"]) if i + 1 < len(words) else None
+        end = float(word["end"])
+        punctuation = bool(re.search(r"[.!?][\"')\]]*$", text))
+        long_pause = next_start is not None and next_start - end >= 0.9
+        if punctuation or long_pause or i == len(words) - 1:
+            ranges.append({
+                "start_word": start,
+                "end_word": i,
+                "start": float(words[start]["start"]),
+                "end": end,
+                "text": " ".join(w["text"] for w in words[start : i + 1]),
+            })
+            start = i + 1
+    return ranges
 
 
 def _build_candidates(words, min_duration, max_duration):
-    """Build a small set of overlapping 20-60s candidate windows."""
-    if not words:
+    """Build sentence-aligned candidate windows distributed across the video."""
+    sentences = _sentence_ranges(words)
+    if not sentences:
         return []
 
     total = float(words[-1]["end"]) - float(words[0]["start"])
-    target = min(45.0, float(max_duration))
-    target = max(float(min_duration), target)
     if total < min_duration:
         return []
 
-    # For short videos, use the whole useful range. For longer videos, sample
-    # roughly every 30 seconds with overlap so interesting moments aren't missed.
-    if total <= target:
-        starts = [0.0]
-    else:
-        step = 30.0
-        max_start = total - target
-        starts = []
-        pos = 0.0
-        while pos <= max_start + 0.01:
-            starts.append(pos)
-            pos += step
-        if starts[-1] < max_start - 5:
-            starts.append(max_start)
+    target = min(42.0, float(max_duration))
+    target = max(float(min_duration), target)
 
     candidates = []
     seen = set()
-    for candidate_id, relative_start in enumerate(starts[:12], 1):
-        absolute_start = float(words[0]["start"]) + relative_start
-        absolute_end = absolute_start + target
-        start_index = min(range(len(words)), key=lambda i: abs(float(words[i]["start"]) - absolute_start))
-        end_index = min(
-            range(start_index, len(words)),
-            key=lambda i: abs(float(words[i]["end"]) - absolute_end),
-        )
-        start = float(words[start_index]["start"])
-        end = float(words[end_index]["end"])
-        if end - start < min_duration or end - start > max_duration:
+    for start_sentence in range(len(sentences)):
+        start_time = sentences[start_sentence]["start"]
+        # Ignore starts that cannot possibly make a minimum-length clip.
+        if float(words[-1]["end"]) - start_time < min_duration:
+            break
+
+        best_end = None
+        for end_sentence in range(start_sentence, len(sentences)):
+            duration = sentences[end_sentence]["end"] - start_time
+            if duration < min_duration:
+                continue
+            if duration > max_duration:
+                break
+            # Prefer a natural end closest to the target duration.
+            distance = abs(duration - target)
+            if best_end is None or distance < best_end[0]:
+                best_end = (distance, end_sentence)
+
+        if best_end is None:
             continue
+        end_sentence = best_end[1]
+        start_index = sentences[start_sentence]["start_word"]
+        end_index = sentences[end_sentence]["end_word"]
         key = (start_index, end_index)
         if key in seen:
             continue
         seen.add(key)
         candidates.append({
-            "id": candidate_id,
+            "id": len(candidates) + 1,
             "start_word": start_index,
             "end_word": end_index,
-            "start": round(start, 2),
-            "end": round(end, 2),
+            "start": round(float(words[start_index]["start"]), 2),
+            "end": round(float(words[end_index]["end"]), 2),
             "text": " ".join(w["text"] for w in words[start_index : end_index + 1]),
         })
 
+    # Keep a diverse set of candidates rather than feeding every overlapping
+    # sentence window to the small local model. Prefer evenly distributed starts.
+    if len(candidates) > 14:
+        positions = [round(i * (len(candidates) - 1) / 13) for i in range(14)]
+        candidates = [candidates[i] for i in sorted(set(positions))]
+
+    # Candidate 1 must not always mean "the opening". Shuffle the candidate
+    # presentation order deterministically so Qwen cannot learn a positional bias.
+    seed = int(hashlib.sha256(" ".join(w["text"] for w in words[:500]).encode("utf-8", "ignore")).hexdigest()[:8], 16)
+    random.Random(seed).shuffle(candidates)
+    for i, candidate in enumerate(candidates, 1):
+        candidate["id"] = i
+
     return candidates
+
+
+def _fallback_clip(words, min_duration, max_duration):
+    """Return a sentence-aligned middle highlight when AI selection fails."""
+    candidates = _build_candidates(words, min_duration, max_duration)
+    if not candidates:
+        return None
+    candidate = min(candidates, key=lambda c: abs((c["start"] + c["end"]) / 2 - (words[0]["start"] + words[-1]["end"]) / 2))
+    return {
+        "start": candidate["start"],
+        "end": candidate["end"],
+        "score": 50,
+        "title": "Highlight",
+        "hook": "A highlight selected from the video's transcript.",
+        "reason": "Fallback used because the local AI selector was unavailable or timed out.",
+        "transcript": candidate["text"],
+    }
 
 
 def select_clips(transcript, max_clips=5, min_duration=20, max_duration=60):
@@ -160,9 +169,6 @@ def select_clips(transcript, max_clips=5, min_duration=20, max_duration=60):
     if not candidates:
         return []
 
-    # The old implementation sent every timestamped word to Qwen. On a CPU-only
-    # GitHub runner that can create a very large prompt and make a 1.7B model take
-    # many minutes. Rank a handful of bounded candidate windows instead.
     candidate_payload = [
         {
             "id": c["id"],
@@ -175,15 +181,19 @@ def select_clips(transcript, max_clips=5, min_duration=20, max_duration=60):
 
     prompt = f"""Choose up to {max_clips} best short-form video clips from these candidate windows.
 
-Rules:
-- Each candidate is already {min_duration}-{max_duration} seconds long.
-- Prefer hooks, surprising insights, stories, humor, emotion, useful advice,
-  strong opinions, controversy, and clear payoffs.
-- Avoid greetings, introductions, ads, filler, and incomplete thoughts.
-- Prefer candidates that work without extra context.
+Important:
+- The candidates are presented in RANDOMIZED order. Candidate ID/order has no relationship to quality or position in the video.
+- Do NOT choose a candidate merely because it appears first in this list.
+- Evaluate the actual spoken content.
+- Prefer a strong standalone hook, useful or surprising information, story, humor,
+  emotion, strong opinion, controversy, or a clear payoff.
+- Avoid greetings, introductions, "in this video" setup, sponsor/ad sections,
+  filler, repetition, and incomplete thoughts.
+- Prefer candidates that make sense without context from earlier in the video.
+- Candidates already begin and end at sentence/thought boundaries.
 - Rank the strongest candidates first.
-- Only use candidate IDs that are supplied.
-- Return fewer than {max_clips} only if necessary.
+- Only use supplied candidate IDs.
+- Return fewer than {max_clips} only if there genuinely are not enough strong moments.
 
 Return exactly:
 {{"clips":[{{"id":1,"score":92,"title":"Short compelling title","hook":"One-sentence hook","reason":"Why this works as a short"}}]}}
@@ -194,10 +204,7 @@ CANDIDATES:
 
     try:
         data = _chat(prompt)
-    except requests.RequestException:
-        fallback = _fallback_clip(words, min_duration, max_duration)
-        return [fallback] if fallback else []
-    except (RuntimeError, ValueError, TypeError):
+    except (requests.RequestException, RuntimeError, ValueError, TypeError):
         fallback = _fallback_clip(words, min_duration, max_duration)
         return [fallback] if fallback else []
 
@@ -214,10 +221,16 @@ CANDIDATES:
         if not candidate or candidate_id in seen_ids:
             continue
         seen_ids.add(candidate_id)
+
+        # A small opening penalty prevents the common failure mode where the
+        # first candidate wins simply because it contains the video's intro.
+        adjusted_score = score
+        if candidate["start"] < 30.0 and score < 90:
+            adjusted_score -= 12
         clips.append({
             "start": candidate["start"],
             "end": candidate["end"],
-            "score": score,
+            "score": max(0, adjusted_score),
             "title": str(raw.get("title", "AI clip"))[:120],
             "hook": str(raw.get("hook", ""))[:300],
             "reason": str(raw.get("reason", ""))[:500],
@@ -226,10 +239,8 @@ CANDIDATES:
 
     clips.sort(key=lambda c: c["score"], reverse=True)
     clips = clips[:max_clips]
-
     if not clips:
         fallback = _fallback_clip(words, min_duration, max_duration)
         if fallback:
             clips = [fallback]
-
     return clips
