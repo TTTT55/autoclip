@@ -21,6 +21,8 @@ from engine.pipeline import get_job, start_job
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 JOB_ID = os.environ.get("AUTOCLIP_JOB_ID", "autoclip")
+TELEGRAM_UPLOAD_TIMEOUT = int(os.getenv("TELEGRAM_UPLOAD_TIMEOUT", "900"))
+TELEGRAM_UPLOAD_RETRIES = max(1, int(os.getenv("TELEGRAM_UPLOAD_RETRIES", "3")))
 
 
 def telegram(method, **payload):
@@ -36,25 +38,46 @@ def send_message(text):
 
 def send_video(path, caption):
     path = Path(path)
-    if path.stat().st_size > 49 * 1024 * 1024:
-        # Telegram's Bot API currently caps multipart uploads at 50 MB. The
-        # renderer normally keeps clips below this threshold; fail clearly if
-        # a particular source still produces an oversized file.
-        telegram("sendMessage", chat_id=CHAT_ID, text=f"⚠️ {caption}\nFile is larger than Telegram's 50 MB bot upload limit: {path.name}")
-        return False
-    with path.open("rb") as video:
-        response = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo",
-            data={
-                "chat_id": CHAT_ID,
-                "caption": caption,
-                "supports_streaming": "true",
-            },
-            files={"video": (path.name, video, "video/mp4")},
-            timeout=300,
+    size = path.stat().st_size
+    if size > 49 * 1024 * 1024:
+        send_message(
+            f"⚠️ {caption}\n"
+            f"File is larger than Telegram's 50 MB bot upload limit: {path.name}"
         )
-        response.raise_for_status()
-    return True
+        return False
+
+    last_error = None
+    for attempt in range(1, TELEGRAM_UPLOAD_RETRIES + 1):
+        try:
+            with path.open("rb") as video:
+                response = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo",
+                    data={
+                        "chat_id": CHAT_ID,
+                        "caption": caption,
+                        "supports_streaming": "true",
+                    },
+                    files={"video": (path.name, video, "video/mp4")},
+                    timeout=(30, TELEGRAM_UPLOAD_TIMEOUT),
+                )
+                response.raise_for_status()
+            return True
+        except requests.RequestException as exc:
+            last_error = exc
+            print(
+                f"Telegram upload attempt {attempt}/{TELEGRAM_UPLOAD_RETRIES} "
+                f"failed for {path.name}: {exc}",
+                flush=True,
+            )
+            if attempt < TELEGRAM_UPLOAD_RETRIES:
+                time.sleep(min(30, 5 * attempt))
+
+    send_message(
+        f"⚠️ Could not send generated clip `{path.name}` to Telegram after "
+        f"{TELEGRAM_UPLOAD_RETRIES} attempts. The clip is still available in "
+        f"the GitHub Actions artifact.\nError: {last_error}"
+    )
+    return False
 
 
 def main():
@@ -97,9 +120,25 @@ def main():
         return
 
     send_message(f"✅ AutoClip finished — {len(clips)} clip(s) generated.")
+    sent = 0
+    failed = 0
     for index, clip in enumerate(clips, 1):
-        caption = f"🎬 Clip {index}/{len(clips)} — {clip.get('title', 'AI clip')}\n⭐ {clip.get('score', 0)}/100\n{clip.get('hook', '')}"
-        send_video(clip["file"], caption)
+        caption = (
+            f"🎬 Clip {index}/{len(clips)} — {clip.get('title', 'AI clip')}\n"
+            f"⭐ {clip.get('score', 0)}/100\n{clip.get('hook', '')}"
+        )
+        if send_video(clip["file"], caption):
+            sent += 1
+        else:
+            failed += 1
+
+    if failed:
+        send_message(
+            f"⚠️ AutoClip processing completed: {sent}/{len(clips)} clips sent to Telegram. "
+            f"{failed} upload(s) failed; generated files remain in the GitHub Actions artifact."
+        )
+    else:
+        send_message(f"✅ All {sent} generated clip(s) were sent successfully.")
 
 
 if __name__ == "__main__":
